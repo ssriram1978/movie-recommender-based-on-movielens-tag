@@ -2,6 +2,7 @@ import json
 import os
 import pathlib
 import pickle
+import time
 
 import pandas as pd
 import numpy as np
@@ -14,12 +15,17 @@ from urllib.request import urlopen
 from imdb import Cinemagoer, helpers
 from flask import jsonify
 
+import concurrent.futures
+from imdb import Cinemagoer, helpers
+import threading
+import time
+
+thread_local = threading.local()
+
 TOP_N_RECOMMENDATIONS = 30
 TOP_N_MAX_SIMILAR_TITLES = 5
 TOP_N_COSINE_SIMILAR_TITLES = 5
 MAX_COSINE_TITLES = 100
-MAX_RECOMMENDATIONS = 250
-
 
 print("Loading md2.csv into pandas dataframe.")
 md2 = pd.read_csv(os.path.join(pathlib.Path(__file__).parent.absolute(), 'md2.csv'),
@@ -57,6 +63,35 @@ cosine_sim_df = pd.read_csv(os.path.join(pathlib.Path(__file__).parent.absolute(
                             index_col=0)
 print("Successfully loaded cosine_similarity_recommender_df.csv into pandas dataframe.")
 
+cinemagoer = Cinemagoer(accessSystem='http')
+
+
+def fetch_movie_url(movie_name):
+    global output
+    index = output["top_k_movies"].index(movie_name)
+
+    search = cinemagoer.search_movie(movie_name)
+    if not search or not len(search):
+        output[str(index) + '_url'] = ""
+        return
+    movie_id = search[0].movieID
+    movie_obj = cinemagoer.get_movie(movie_id)
+    if not movie_obj:
+        output[str(index) + '_url'] = ""
+        return
+    url = helpers.fullSizeCoverURL(movie_obj)
+    compressed_url = helpers.resizeImage(url, width=200, height=400)
+    output[str(index) + '_url'] = compressed_url
+
+
+def download_posters_for_all_titles():
+    global output
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        executor.map(fetch_movie_url, output["top_k_movies"], timeout=1)
+
+
+output = None
+
 
 def get_recommendations(title):
     idx = md2.index[md2['title'].str.startswith(title)]
@@ -92,7 +127,7 @@ def get_recommendations_from_combinations(title):
     if df.empty:
         print(f'df = {df}, unable to find any movie with that title.')
         return None
-    return df.sort_values('rating', ascending=False).head(MAX_RECOMMENDATIONS)['title'].tolist()
+    return df.sort_values('rating', ascending=False).head(TOP_N_RECOMMENDATIONS)['title'].tolist()
 
 
 def check(tagList, input_str):
@@ -117,8 +152,10 @@ def check(tagList, input_str):
 
 
 def lambda_handler(event, context):
+    global output
     top_k_movies = []
     try:
+        start_time = time.time()
         print(f"event={event}")
         title = event['multiValueQueryStringParameters']['Title'][0]
         userId = event['multiValueQueryStringParameters']['UserId'][0]
@@ -126,35 +163,26 @@ def lambda_handler(event, context):
         title_similarity_items = get_recommendations(title)
         tag_similarity_items = get_recommendations_from_combinations(title)
         if title_similarity_items and len(title_similarity_items):
+            print(f'Title similarity = {title_similarity_items}')
             top_k_movies += title_similarity_items
         if tag_similarity_items and len(tag_similarity_items):
+            print(f'Tag similarity = {tag_similarity_items}')
             top_k_movies += tag_similarity_items
+        print(f"--- Time taken for computing recommendations for search query = "
+              f"{(time.time() - start_time)} seconds ---")
     except Exception:
         # printing stack trace
         traceback.print_exception(*sys.exc_info())
         print(traceback.format_exc())
     finally:
+        print(f' Fetching Movie URL posters for these recommended movie titles...')
+        start_time = time.time()
         output = {"top_k_movies": top_k_movies}
 
-        ia = Cinemagoer()
-        for index, movie in enumerate(top_k_movies):
-            if index == TOP_N_RECOMMENDATIONS:
-                break
-            search = ia.search_movie(movie)
-            if not search or not len(search):
-                output[str(index) + '_url'] = ""
-                continue
-            movie_id = search[0].movieID
-            movie_obj = ia.get_movie(movie_id)
-            url = helpers.fullSizeCoverURL(movie_obj)
-            # print(f'for movie = {movie}, movie_id={movie_id}, url = {url}')
-            try:
-                compressed_url = helpers.resizeImage(url, width=200, height=400)
-            except:
-                compressed_url = url
-            output[str(index) + '_url'] = compressed_url
-            # output['poster-' + str(index)] = 'data:image/jpg;base64,' + base64.b64encode(
-            #    urlopen(compressed_url).read()).decode('utf-8')
+        download_posters_for_all_titles()
+        print(f'Final output = {json.dumps(output, indent=4)}')
+        print(f"--- Time taken for finalizing search results with movie poster URLS  = "
+              f"{(time.time() - start_time)} seconds ---")
         return {
             'statusCode': 200,
             'body': json.dumps(output)
